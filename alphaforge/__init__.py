@@ -1,1 +1,1 @@
-"""AlphaForge package for modular stock analysis components."""\n
+"""AlphaForge package for modular stock analysis components."""
