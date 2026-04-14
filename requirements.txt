@@ -1,1 +1,3 @@
-streamlit>=1.32,<2.0\nyfinance>=0.2.40,<1.0\npandas>=2.0,<3.0\nrequests>=2.31,<3.0\npytest>=8.0,<9.0\n
+streamlit>=1.32,<2.0
+yfinance>=0.2.40,<1.0
+requests>=2.31,<3.0
