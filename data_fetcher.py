@@ -87,7 +87,16 @@ def get_stock_data(ticker: str) -> dict:
             "limitations": limitations,
         }
 
-    sec_income_data = get_sec_income_data(ticker)
+    try:
+        sec_income_data = get_sec_income_data(ticker)
+    except Exception as error:
+        sec_income_data = {
+            "status": "error",
+            "note": "SEC data unavailable",
+            "error": str(error),
+            "message": "SEC data unavailable",
+            "limitations": ["SEC data could not be parsed for this ticker."],
+        }
     limitations.extend(sec_income_data.get("limitations", []))
 
     if not isinstance(info, dict) or not info:

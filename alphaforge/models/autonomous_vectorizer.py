@@ -634,6 +634,64 @@ def _build_narratives(
     }
 
 
+def _build_error_result(symbol: str, analyzed_at: str, error: str) -> AutonomousAnalysisResult:
+    """Return a stable error result without raising."""
+    shariah = ShariahScreenResult(
+        passed=False,
+        status="FAIL",
+        violations=[],
+        warnings=[error],
+        debt_to_market_cap=None,
+        sector=None,
+        industry=None,
+        income_screen_note="SEC data unavailable",
+    )
+    catalyst = CatalystResult(0.0, "none", "Analysis could not be completed.", "none", "fallback")
+    scores = ScoreBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05, -0.05, 0.0, {})
+    return AutonomousAnalysisResult(
+        ticker=symbol,
+        analyzed_at_pk_time=analyzed_at,
+        status="error",
+        error=error,
+        latest_price=None,
+        price_change_5d_pct=None,
+        relative_strength_vs_spy=None,
+        volatility_regime="unknown",
+        compression_status="unknown",
+        regime="choppy",
+        market_structure="mean_reverting",
+        tier="UNABLE TO ANALYZE",
+        trade_signal="SKIP",
+        shariah=shariah,
+        catalyst=catalyst,
+        scores=scores,
+        technical_metrics={},
+        narratives={"summary": error},
+        flags=[error],
+    )
+
+
+def make_serializable(obj: Any) -> Any:
+    """Recursively convert objects into JSON-safe structures."""
+    if obj is None or isinstance(obj, (str, int, float, bool, np.integer, np.floating)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(key): make_serializable(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [make_serializable(item) for item in obj]
+    if hasattr(obj, "to_dict"):
+        try:
+            return make_serializable(obj.to_dict())
+        except Exception:
+            return str(obj)
+    if hasattr(obj, "__dict__"):
+        try:
+            return make_serializable(vars(obj))
+        except Exception:
+            return str(obj)
+    return str(obj)
+
+
 def analyze_ticker(
     ticker: str,
     *,
@@ -656,90 +714,104 @@ def analyze_ticker(
     spy_history_fetcher = spy_history_fetcher or (lambda: _download_history("SPY", "1y", "1d"))
     catalyst_fetcher = catalyst_fetcher or _evaluate_catalyst
 
-    daily = daily_history_fetcher(symbol)
-    intraday = intraday_history_fetcher(symbol)
-    spy_daily = spy_history_fetcher()
-    stock_data = stock_data_fetcher(symbol)
-    shariah = _screen_shariah(stock_data)
-    catalyst = catalyst_fetcher(symbol)
+    try:
+        daily = daily_history_fetcher(symbol)
+        intraday = intraday_history_fetcher(symbol)
+        spy_daily = spy_history_fetcher()
+    except Exception as error:
+        return _build_error_result(symbol, analyzed_at, str(error))
 
-    if daily is None or daily.empty or spy_daily is None or spy_daily.empty:
-        scores = ScoreBreakdown(0.0, 0.0, 0.0, 0.0, round(catalyst.score, 2), 0.0, -0.05, -0.05, 0.0, {})
-        return AutonomousAnalysisResult(symbol, analyzed_at, "error", "Insufficient data.", None, None, None, "unknown", "unknown", "choppy", "mean_reverting", "Disqualified", "DISQUALIFIED", shariah, catalyst, scores, {}, {"summary": "Price history was unavailable or incomplete."}, ["Insufficient data"])
+    try:
+        stock_data = stock_data_fetcher(symbol)
+    except Exception as error:
+        return _build_error_result(symbol, analyzed_at, str(error))
 
-    intraday = intraday if intraday is not None else pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
-    four_hour = _resample_to_4h(intraday) if not intraday.empty else pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+    try:
+        shariah = _screen_shariah(stock_data if isinstance(stock_data, dict) else {})
+        try:
+            catalyst = catalyst_fetcher(symbol)
+        except Exception:
+            catalyst = CatalystResult(0.3, "none", "No catalyst data available.", "none", "fallback")
 
-    volatility_regime, volatility_metrics = _evaluate_volatility_regime(daily)
-    bbw_score, compression_status, bbw_metrics = _evaluate_bbw(daily)
-    momentum_score, momentum_metrics = _evaluate_momentum(daily, spy_daily)
-    volume_score, volume_metrics = _evaluate_volume(daily)
-    confluence_score, confluence_metrics = _evaluate_confluence(daily, four_hour, intraday)
-    mean_reversion_metrics = _evaluate_mean_reversion(daily, volatility_regime)
-    regime, regime_metrics = _evaluate_regime(daily)
-    market_structure, market_structure_metrics = _evaluate_market_structure(daily)
-    significance_score, significance_bonus, significance_metrics = _evaluate_significance(daily)
+        if daily is None or daily.empty or spy_daily is None or spy_daily.empty:
+            scores = ScoreBreakdown(0.0, 0.0, 0.0, 0.0, round(catalyst.score, 2), 0.0, -0.05, -0.05, 0.0, {})
+            return AutonomousAnalysisResult(symbol, analyzed_at, "error", "Insufficient data.", None, None, None, "unknown", "unknown", "choppy", "mean_reverting", "Disqualified", "DISQUALIFIED", shariah, catalyst, scores, {}, {"summary": "Price history was unavailable or incomplete."}, ["Insufficient data"])
 
-    weights, regime_bonus = _build_weights(regime)
-    composite = (
-        momentum_score * weights["momentum"]
-        + volume_score * weights["volume"]
-        + confluence_score * weights["confluence"]
-        + bbw_score * weights["bbw"]
-        + catalyst.score * weights["catalyst"]
-        + regime_bonus
-        + significance_bonus
-    )
-    composite = 0.0 if not shariah.passed else _clip(composite)
-    scores = ScoreBreakdown(
-        momentum=round(momentum_score, 2),
-        volume=round(volume_score, 2),
-        confluence=round(confluence_score, 2),
-        bbw=round(bbw_score, 2),
-        catalyst=round(catalyst.score, 2),
-        significance=round(significance_score, 2),
-        regime_bonus=round(regime_bonus, 2),
-        significance_bonus=round(significance_bonus, 2),
-        composite=round(composite, 2),
-        weights=weights,
-    )
-    technical_metrics = {
-        "volatility": volatility_metrics,
-        "bbw": bbw_metrics,
-        "momentum": momentum_metrics,
-        "volume": volume_metrics,
-        "confluence": confluence_metrics,
-        "mean_reversion": mean_reversion_metrics,
-        "regime": regime_metrics,
-        "market_structure": {"label": market_structure, **market_structure_metrics},
-        "significance": significance_metrics,
-    }
-    tier = _classify_tier(scores.composite, shariah.passed)
-    trade_signal = _classify_signal(scores.composite, shariah, regime, scores.confluence, significance_metrics)
-    flags = [warning for warning in shariah.warnings]
-    if intraday.empty:
-        flags.append("Partial intraday data.")
-    return AutonomousAnalysisResult(
-        ticker=symbol,
-        analyzed_at_pk_time=analyzed_at,
-        status="ok",
-        error=None,
-        latest_price=_safe_float(daily["Close"].iloc[-1]),
-        price_change_5d_pct=momentum_metrics["momentum_5d"],
-        relative_strength_vs_spy=momentum_metrics["relative_strength_vs_spy"],
-        volatility_regime=volatility_regime,
-        compression_status=compression_status,
-        regime=regime,
-        market_structure=market_structure,
-        tier=tier,
-        trade_signal=trade_signal,
-        shariah=shariah,
-        catalyst=catalyst,
-        scores=scores,
-        technical_metrics=technical_metrics,
-        narratives=_build_narratives(scores, catalyst, regime, shariah, technical_metrics),
-        flags=flags,
-    )
+        intraday = intraday if intraday is not None else pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+        four_hour = _resample_to_4h(intraday) if not intraday.empty else pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+
+        volatility_regime, volatility_metrics = _evaluate_volatility_regime(daily)
+        bbw_score, compression_status, bbw_metrics = _evaluate_bbw(daily)
+        momentum_score, momentum_metrics = _evaluate_momentum(daily, spy_daily)
+        volume_score, volume_metrics = _evaluate_volume(daily)
+        confluence_score, confluence_metrics = _evaluate_confluence(daily, four_hour, intraday)
+        mean_reversion_metrics = _evaluate_mean_reversion(daily, volatility_regime)
+        regime, regime_metrics = _evaluate_regime(daily)
+        market_structure, market_structure_metrics = _evaluate_market_structure(daily)
+        significance_score, significance_bonus, significance_metrics = _evaluate_significance(daily)
+
+        weights, regime_bonus = _build_weights(regime)
+        composite = (
+            momentum_score * weights["momentum"]
+            + volume_score * weights["volume"]
+            + confluence_score * weights["confluence"]
+            + bbw_score * weights["bbw"]
+            + catalyst.score * weights["catalyst"]
+            + regime_bonus
+            + significance_bonus
+        )
+        composite = 0.0 if not shariah.passed else _clip(composite)
+        scores = ScoreBreakdown(
+            momentum=round(momentum_score, 2),
+            volume=round(volume_score, 2),
+            confluence=round(confluence_score, 2),
+            bbw=round(bbw_score, 2),
+            catalyst=round(catalyst.score, 2),
+            significance=round(significance_score, 2),
+            regime_bonus=round(regime_bonus, 2),
+            significance_bonus=round(significance_bonus, 2),
+            composite=round(composite, 2),
+            weights=weights,
+        )
+        technical_metrics = {
+            "volatility": volatility_metrics,
+            "bbw": bbw_metrics,
+            "momentum": momentum_metrics,
+            "volume": volume_metrics,
+            "confluence": confluence_metrics,
+            "mean_reversion": mean_reversion_metrics,
+            "regime": regime_metrics,
+            "market_structure": {"label": market_structure, **market_structure_metrics},
+            "significance": significance_metrics,
+        }
+        tier = _classify_tier(scores.composite, shariah.passed)
+        trade_signal = _classify_signal(scores.composite, shariah, regime, scores.confluence, significance_metrics)
+        flags = [warning for warning in shariah.warnings]
+        if intraday.empty:
+            flags.append("Partial intraday data.")
+        return AutonomousAnalysisResult(
+            ticker=symbol,
+            analyzed_at_pk_time=analyzed_at,
+            status="ok",
+            error=None,
+            latest_price=_safe_float(daily["Close"].iloc[-1]),
+            price_change_5d_pct=momentum_metrics["momentum_5d"],
+            relative_strength_vs_spy=momentum_metrics["relative_strength_vs_spy"],
+            volatility_regime=volatility_regime,
+            compression_status=compression_status,
+            regime=regime,
+            market_structure=market_structure,
+            tier=tier,
+            trade_signal=trade_signal,
+            shariah=shariah,
+            catalyst=catalyst,
+            scores=scores,
+            technical_metrics=technical_metrics,
+            narratives=_build_narratives(scores, catalyst, regime, shariah, technical_metrics),
+            flags=flags,
+        )
+    except Exception as error:
+        return _build_error_result(symbol, analyzed_at, str(error))
 
 
 def analyze_tickers(
@@ -765,7 +837,7 @@ def analyze_tickers(
             try:
                 results.append(future.result())
             except Exception:
-                results.append(analyze_ticker(futures[future], daily_history_fetcher=lambda _: None, intraday_history_fetcher=lambda _: None, spy_history_fetcher=lambda: None))
+                results.append(_build_error_result(futures[future], _now_pkt_iso(), "Unable to analyze ticker."))
 
     tier_order = {"Tier 1": 0, "Tier 2": 1, "Tier 3": 2, "Disqualified": 3}
     results.sort(key=lambda item: (tier_order.get(item.tier, 4), -item.scores.composite, item.ticker))
@@ -773,8 +845,11 @@ def analyze_tickers(
 
 
 def export_autonomous_results_json(results: list[AutonomousAnalysisResult | dict[str, Any]]) -> str:
-    payload = [result.to_dict() if hasattr(result, "to_dict") else result for result in results]
-    return json.dumps(payload, indent=2)
+    payload = [make_serializable(result.to_dict() if hasattr(result, "to_dict") else result) for result in results]
+    try:
+        return json.dumps(payload, indent=2)
+    except Exception:
+        return json.dumps(make_serializable(payload), indent=2, default=str)
 
 
 def parse_ticker_text(text: str) -> list[str]:

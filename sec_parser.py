@@ -88,12 +88,19 @@ def _pick_latest_fact(unit_items: list[dict[str, Any]]) -> dict | None:
     if not dated_items:
         return None
 
-    sorted_items = sorted(
-        dated_items,
-        key=lambda item: (item.get("fy", 0), item.get("end", ""), item.get("filed", "")),
-        reverse=True,
-    )
-    return sorted_items[0]
+    try:
+        sorted_items = sorted(
+            dated_items,
+            key=lambda item: (
+                int(item.get("fy", 0) or 0),
+                str(item.get("end", "") or ""),
+                str(item.get("filed", "") or ""),
+            ),
+            reverse=True,
+        )
+        return sorted_items[0]
+    except Exception:
+        return dated_items[0]
 
 
 def _get_fact_value(company_facts: dict, concept_names: list[str]) -> dict | None:
@@ -175,58 +182,61 @@ def _get_cik_for_ticker(ticker: str) -> dict:
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_sec_income_data(ticker: str) -> dict:
     """Fetch best-effort income-screen data from the SEC."""
-    limitations = [
-        "SEC income screening is best-effort and depends on which XBRL facts the company filed.",
-        "Some companies do not expose a clean interest-income or non-core-income fact in a way that can be screened automatically.",
-        "A missing SEC fact does not prove the company has zero non-compliant income.",
-        "Some SEC concepts can overlap, so this MVP prioritizes one best candidate fact instead of summing everything.",
-    ]
-
     try:
+        limitations = [
+            "SEC income screening is best-effort and depends on which XBRL facts the company filed.",
+            "Some companies do not expose a clean interest-income or non-core-income fact in a way that can be screened automatically.",
+            "A missing SEC fact does not prove the company has zero non-compliant income.",
+            "Some SEC concepts can overlap, so this MVP prioritizes one best candidate fact instead of summing everything.",
+        ]
+
         cik_result = _get_cik_for_ticker(ticker)
         if cik_result["status"] != "ok":
             return {
                 "status": "error",
                 "message": cik_result["message"],
+                "note": "SEC data unavailable",
+                "error": cik_result["message"],
                 "limitations": limitations,
             }
 
         company_facts = _get_json(SEC_COMPANY_FACTS_URL.format(cik=cik_result["cik"]))
+
+        revenue_fact = _get_fact_value(
+            company_facts,
+            [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "Revenues",
+                "SalesRevenueNet",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+            ],
+        )
+
+        non_core_income_facts = []
+        for category, concept_names in NON_CORE_INCOME_CONCEPT_GROUPS.items():
+            non_core_income_facts.extend(
+                _get_matching_facts(company_facts, concept_names, category)
+            )
+
+        selected_non_core_income_fact = non_core_income_facts[0] if non_core_income_facts else None
+
+        return {
+            "status": "ok",
+            "message": "SEC filing data fetched successfully.",
+            "limitations": limitations,
+            "cik": cik_result["cik"],
+            "sec_company_name": cik_result.get("company_name"),
+            "revenue_fact": revenue_fact,
+            "selected_non_core_income_fact": selected_non_core_income_fact,
+            "non_core_income_facts": non_core_income_facts,
+        }
     except Exception as error:
         return {
             "status": "error",
-            "message": (
-                "Could not fetch SEC filing data right now. "
-                f"Technical detail: {error}"
-            ),
-            "limitations": limitations,
+            "note": "SEC data unavailable",
+            "error": str(error),
+            "message": "SEC data unavailable",
+            "limitations": [
+                "SEC income screening is best-effort and depends on which XBRL facts the company filed.",
+            ],
         }
-
-    revenue_fact = _get_fact_value(
-        company_facts,
-        [
-            "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "Revenues",
-            "SalesRevenueNet",
-            "RevenueFromContractWithCustomerIncludingAssessedTax",
-        ],
-    )
-
-    non_core_income_facts = []
-    for category, concept_names in NON_CORE_INCOME_CONCEPT_GROUPS.items():
-        non_core_income_facts.extend(
-            _get_matching_facts(company_facts, concept_names, category)
-        )
-
-    selected_non_core_income_fact = non_core_income_facts[0] if non_core_income_facts else None
-
-    return {
-        "status": "ok",
-        "message": "SEC filing data fetched successfully.",
-        "limitations": limitations,
-        "cik": cik_result["cik"],
-        "sec_company_name": cik_result.get("company_name"),
-        "revenue_fact": revenue_fact,
-        "selected_non_core_income_fact": selected_non_core_income_fact,
-        "non_core_income_facts": non_core_income_facts,
-    }

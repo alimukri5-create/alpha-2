@@ -489,7 +489,46 @@ def run_autonomous_single(ticker: str) -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def run_autonomous_batch(tickers: tuple[str, ...]) -> list[dict]:
     """Run the autonomous engine for a batch of tickers with short-lived caching."""
-    return [result.to_dict() for result in analyze_tickers(list(tickers))]
+    results: list[dict] = []
+    for ticker in tickers:
+        try:
+            results.append(analyze_ticker(ticker).to_dict())
+        except Exception as error:
+            results.append(
+                {
+                    "ticker": ticker,
+                    "status": "error",
+                    "error": str(error),
+                    "latest_price": None,
+                    "price_change_5d_pct": None,
+                    "relative_strength_vs_spy": None,
+                    "volatility_regime": "unknown",
+                    "compression_status": "unknown",
+                    "regime": "choppy",
+                    "market_structure": "mean_reverting",
+                    "composite": 0.0,
+                    "tier": "UNABLE TO ANALYZE",
+                    "trade_signal": "SKIP",
+                    "shariah": {"status": "FAIL", "warnings": [str(error)], "violations": []},
+                    "catalyst": {"catalyst_type": "none", "summary": "Batch analysis failed for this ticker."},
+                    "scores": {
+                        "momentum": 0.0,
+                        "volume": 0.0,
+                        "confluence": 0.0,
+                        "bbw": 0.0,
+                        "catalyst": 0.0,
+                        "significance": 0.0,
+                        "regime_bonus": -0.05,
+                        "significance_bonus": -0.05,
+                        "composite": 0.0,
+                    },
+                    "technical_metrics": {},
+                    "narratives": {"summary": str(error)},
+                    "flags": [str(error)],
+                    "analyzed_at_pk_time": datetime.now().isoformat(),
+                }
+            )
+    return results
 
 
 def _format_signal_badge(value: str) -> str:
