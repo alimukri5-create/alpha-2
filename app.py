@@ -1,10 +1,18 @@
 """Streamlit app for the legacy screener and AlphaForge Phase 1 MVP."""
 
+from datetime import datetime
+
+import pandas as pd
 import streamlit as st
 
 from alphaforge.config import DEFAULT_PERIOD, DEFAULT_TICKER, SUPPORTED_PERIODS
 from alphaforge.data.fetch import get_price_history
 from alphaforge.models.fusion import build_trade_map
+from alphaforge.models.momentum_vectorizer import (
+    MomentumSignalVectorizer,
+    export_signals_for_claude,
+    export_signals_json,
+)
 from alphaforge.models.realized_vol import calculate_realized_volatility
 from alphaforge.models.technicals import calculate_technical_structure
 from data_fetcher import get_stock_data
@@ -14,6 +22,8 @@ from utils import clean_ticker, format_number, format_percentage, get_status_lab
 
 
 st.set_page_config(page_title="AlphaForge")
+
+VECTORIZER = MomentumSignalVectorizer()
 
 
 def show_ratio_table(ratio_results: list[dict]) -> None:
@@ -156,6 +166,52 @@ def format_vol(value: float | None) -> str:
     return f"{value:.1%}"
 
 
+def format_tier_label(signal: dict) -> str:
+    """Format a concise tier label for the summary table."""
+    return signal["local_tier"]
+
+
+def ensure_signal_state() -> list[dict]:
+    """Initialize session storage for manual vectorized signals."""
+    if "vectorized_signals" not in st.session_state:
+        st.session_state["vectorized_signals"] = []
+    return st.session_state["vectorized_signals"]
+
+
+def lookup_shariah_context(ticker: str) -> dict:
+    """Run the existing screener stack for optional context lookup."""
+    cleaned_ticker = clean_ticker(ticker)
+    if not cleaned_ticker:
+        return {"status": "error", "message": "Enter a ticker before running the lookup."}
+
+    stock_data = get_stock_data(cleaned_ticker)
+    if stock_data["status"] != "ok":
+        return {
+            "status": "error",
+            "message": stock_data["message"],
+            "limitations": stock_data.get("limitations", []),
+        }
+
+    result = screen_stock(stock_data, get_default_methodology())
+    debt_to_market_cap = None
+    for ratio in result["financial_screen"]["ratio_results"]:
+        if ratio["key"] == "debt_to_market_cap":
+            debt_to_market_cap = ratio.get("value")
+            break
+
+    return {
+        "status": "ok",
+        "ticker": cleaned_ticker,
+        "final_verdict": result["final_verdict"],
+        "business_status": result["business_screen"]["status"],
+        "financial_status": result["financial_screen"]["status"],
+        "income_status": result["income_screen"]["status"],
+        "debt_to_market_cap": debt_to_market_cap,
+        "limitations": result.get("limitations", []),
+        "plain_english_explanation": result["plain_english_explanation"],
+    }
+
+
 def show_alphaforge_screen() -> None:
     """Render the new AlphaForge Phase 1 screen."""
     st.title("AlphaForge Phase 1")
@@ -249,6 +305,174 @@ def show_alphaforge_screen() -> None:
     )
 
 
+def show_momentum_vectorizer() -> None:
+    """Render the manual momentum vectorizer workflow."""
+    st.title("Momentum Vectorizer")
+    st.write(
+        "Turn manual momentum observations into structured JSON, a local edge tier, "
+        "and a copy-ready Claude review prompt."
+    )
+
+    signals_log = ensure_signal_state()
+    lookup_ticker = st.text_input("Optional lookup ticker", value="", key="vectorizer_lookup_ticker")
+
+    lookup_state = st.session_state.get("vectorizer_lookup_result")
+    if lookup_state:
+        if lookup_state["status"] == "ok":
+            st.info(
+                f"Optional screener lookup for {lookup_state['ticker']}: "
+                f"{lookup_state['final_verdict']} "
+                f"(business {get_status_label(lookup_state['business_status'])}, "
+                f"financial {get_status_label(lookup_state['financial_status'])}, "
+                f"income {get_status_label(lookup_state['income_status'])})."
+            )
+            if lookup_state.get("debt_to_market_cap") is not None:
+                st.caption(
+                    f"Fetched debt / market cap: {format_percentage(lookup_state['debt_to_market_cap'])}"
+                )
+            for note in lookup_state.get("limitations", []):
+                st.write(f"- {note}")
+        else:
+            st.warning(lookup_state["message"])
+            for note in lookup_state.get("limitations", []):
+                st.write(f"- {note}")
+
+    lookup_col1, lookup_col2 = st.columns([1, 3])
+    if lookup_col1.button("Run Optional Shariah Lookup"):
+        with st.spinner("Fetching existing screener context..."):
+            st.session_state["vectorizer_lookup_result"] = lookup_shariah_context(lookup_ticker)
+        st.rerun()
+
+    if lookup_col2.button("Clear Lookup Context"):
+        st.session_state.pop("vectorizer_lookup_result", None)
+        st.rerun()
+
+    with st.form("momentum_vectorizer_form", clear_on_submit=False):
+        ticker_col, price_col, debt_col = st.columns(3)
+        ticker = ticker_col.text_input("Ticker", value="")
+        current_price = price_col.number_input("Current price", min_value=0.0, value=10.0, step=0.01)
+        default_debt_ratio = 0.2
+        if lookup_state and lookup_state.get("status") == "ok" and lookup_state.get("debt_to_market_cap") is not None:
+            default_debt_ratio = float(lookup_state["debt_to_market_cap"])
+        debt_to_mcap = debt_col.number_input(
+            "Debt / market cap",
+            min_value=0.0,
+            max_value=5.0,
+            value=float(default_debt_ratio),
+            step=0.01,
+            help="Manual-first input. Optional screener lookup can suggest a value.",
+        )
+
+        signal_col, win_col, hold_col = st.columns(3)
+        entry_signal_strength = signal_col.slider("Entry signal strength", min_value=0.0, max_value=10.0, value=6.5, step=0.1)
+        prior_pattern_win_rate = win_col.slider("Prior pattern win rate", min_value=0.0, max_value=1.0, value=0.55, step=0.01)
+        swing_target_days = hold_col.number_input("Target hold (days)", min_value=1, max_value=60, value=5, step=1)
+
+        catalyst_col1, catalyst_col2, catalyst_col3 = st.columns(3)
+        catalyst_type = catalyst_col1.selectbox(
+            "Catalyst type",
+            ["earnings", "macro", "sector", "supply_shock", "insider_activity", "none"],
+        )
+        catalyst_magnitude = catalyst_col2.selectbox("Catalyst magnitude", ["major", "moderate", "minor"])
+        catalyst_timing = catalyst_col3.selectbox("Catalyst timing", ["today", "this_week", "next_week", "uncertain"])
+
+        action_col1, action_col2, action_col3 = st.columns(3)
+        price_action_timeframe = action_col1.selectbox("Price-action timeframe", ["intraday", "1d", "multiday", "weekly"])
+        vol_vs_20day_avg = action_col2.number_input("Volume vs 20-day avg", min_value=0.0, value=1.2, step=0.1)
+        price_momentum_5d = action_col3.number_input("5-day momentum (%)", value=0.0, step=0.1)
+
+        confluence_text = st.text_area(
+            "Confluence factors",
+            value="",
+            help="Enter one factor per line, or separate them with commas.",
+        )
+        notes = st.text_area("Notes", value="")
+
+        add_signal = st.form_submit_button("Add Signal", type="primary")
+
+    if add_signal:
+        cleaned_ticker = clean_ticker(ticker)
+        if not cleaned_ticker:
+            st.error("Please enter a ticker before adding a signal.")
+        else:
+            confluence_factors = [
+                item.strip()
+                for chunk in confluence_text.splitlines()
+                for item in chunk.split(",")
+                if item.strip()
+            ]
+            signal = VECTORIZER.vectorize_signal(
+                ticker=cleaned_ticker,
+                current_price=current_price,
+                entry_signal_strength=entry_signal_strength,
+                confluence_factors=confluence_factors,
+                catalyst_type=catalyst_type,
+                catalyst_magnitude=catalyst_magnitude,
+                catalyst_timing=catalyst_timing,
+                price_action_timeframe=price_action_timeframe,
+                vol_vs_20day_avg=vol_vs_20day_avg,
+                price_momentum_5d=price_momentum_5d,
+                debt_to_mcap=debt_to_mcap,
+                swing_target_days=swing_target_days,
+                prior_pattern_win_rate=prior_pattern_win_rate,
+                notes=notes,
+                shariah_lookup=lookup_state if lookup_state and lookup_state.get("status") == "ok" else None,
+            )
+            signals_log.append(signal.to_dict())
+            st.success(f"Added {cleaned_ticker} as {signal.local_tier}.")
+
+    st.subheader("Signals")
+    if not signals_log:
+        st.info("No signals added yet. Fill the form, then add your first setup.")
+        return
+
+    summary_rows = []
+    for signal in signals_log:
+        summary_rows.append(
+            {
+                "Ticker": signal["ticker"],
+                "Price": signal["price"],
+                "Signal Strength": signal["signal_strength"],
+                "Confluence": signal["confluence_count"],
+                "Catalyst": signal["catalyst"]["type"],
+                "Conviction": signal["scores"]["conviction"],
+                "Timeframe": signal["scores"]["timeframe_alignment"],
+                "Volume": signal["scores"]["volume_confirmation"],
+                "Catalyst Score": signal["scores"]["catalyst_strength"],
+                "Composite": signal["scores"]["composite_quality"],
+                "Tier": format_tier_label(signal),
+                "Shariah": "Pass" if signal["shariah_compliance"]["passed"] else "Fail",
+            }
+        )
+
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Clear Signals"):
+        st.session_state["vectorized_signals"] = []
+        st.rerun()
+
+    export_json = export_signals_json(signals_log)
+    filename = f"momentum_signals_{datetime.now().strftime('%Y%m%d')}.json"
+    action_col2.download_button(
+        "Download JSON",
+        data=export_json,
+        file_name=filename,
+        mime="application/json",
+    )
+
+    st.subheader("Claude Prompt")
+    st.code(export_signals_for_claude(signals_log), language="text")
+
+    st.subheader("Raw JSON")
+    st.code(export_json, language="json")
+
+    st.caption(
+        "This workflow is manual-first and export-focused. The optional Shariah lookup uses the existing "
+        "prototype screener stack and may be incomplete or rate-limited."
+    )
+
+
 def show_legacy_screener() -> None:
     """Render the original screener with minimal changes."""
     st.title("Shariah Stock Screener MVP")
@@ -296,11 +520,13 @@ def show_legacy_screener() -> None:
 
 def main() -> None:
     """Build the Streamlit page."""
-    tab1, tab2 = st.tabs(["AlphaForge Phase 1", "Legacy Screener"])
+    tab1, tab2, tab3 = st.tabs(["AlphaForge Phase 1", "Legacy Screener", "Momentum Vectorizer"])
     with tab1:
         show_alphaforge_screen()
     with tab2:
         show_legacy_screener()
+    with tab3:
+        show_momentum_vectorizer()
 
 
 if __name__ == "__main__":
