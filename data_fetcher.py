@@ -7,9 +7,9 @@ It is not an official institutional data feed.
 from __future__ import annotations
 
 import time
-from functools import lru_cache
 from typing import Any
 
+import streamlit as st
 import yfinance as yf
 from sec_parser import get_sec_income_data
 
@@ -63,7 +63,7 @@ def _safe_get_info(stock: yf.Ticker, max_attempts: int = 3) -> tuple[dict | None
     return None, last_error
 
 
-@lru_cache(maxsize=128)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_stock_data(ticker: str) -> dict:
     """Fetch raw company and financial fields for one ticker.
 

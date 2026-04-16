@@ -8,6 +8,13 @@ import streamlit as st
 from alphaforge.config import DEFAULT_PERIOD, DEFAULT_TICKER, SUPPORTED_PERIODS
 from alphaforge.data.fetch import get_price_history
 from alphaforge.models.fusion import build_trade_map
+from alphaforge.models.autonomous_vectorizer import (
+    analyze_ticker,
+    analyze_tickers,
+    export_autonomous_results_json,
+    parse_ticker_csv,
+    parse_ticker_text,
+)
 from alphaforge.models.momentum_vectorizer import (
     MomentumSignalVectorizer,
     export_signals_for_claude,
@@ -473,6 +480,174 @@ def show_momentum_vectorizer() -> None:
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def run_autonomous_single(ticker: str) -> dict:
+    """Run the autonomous engine for one ticker with short-lived caching."""
+    return analyze_ticker(ticker).to_dict()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_autonomous_batch(tickers: tuple[str, ...]) -> list[dict]:
+    """Run the autonomous engine for a batch of tickers with short-lived caching."""
+    return [result.to_dict() for result in analyze_tickers(list(tickers))]
+
+
+def _format_signal_badge(value: str) -> str:
+    """Render a concise status label."""
+    mapping = {"BUY": "BUY", "WATCH": "WATCH", "SKIP": "SKIP", "DISQUALIFIED": "DISQUALIFIED"}
+    return mapping.get(value, value)
+
+
+def _autonomous_summary_rows(results: list[dict]) -> list[dict]:
+    """Flatten result dictionaries into summary table rows."""
+    rows = []
+    for item in results:
+        scores = item["scores"]
+        shariah = item["shariah"]
+        rows.append(
+            {
+                "Ticker": item["ticker"],
+                "Price": item["latest_price"],
+                "Momentum%": item["price_change_5d_pct"],
+                "Volume": item["technical_metrics"].get("volume", {}).get("volume_ratio_20d"),
+                "BBW Comp": scores["bbw"],
+                "RS": item["relative_strength_vs_spy"],
+                "Regime": item["regime"],
+                "Confluence": scores["confluence"],
+                "Catalyst": item["catalyst"]["catalyst_type"],
+                "Shariah": shariah["status"],
+                "Composite": scores["composite"],
+                "Tier": item["tier"],
+                "Signal": _format_signal_badge(item["trade_signal"]),
+                "Status": item["status"],
+            }
+        )
+    return rows
+
+
+def show_autonomous_result_card(result: dict) -> None:
+    """Render one detailed autonomous analysis card."""
+    scores = result["scores"]
+    metrics = result["technical_metrics"]
+    shariah = result["shariah"]
+    headline = f"{result['ticker']} | {result['tier']} | {result['trade_signal']} | Composite {scores['composite']:.2f}"
+    with st.expander(headline):
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Price", f"${result['latest_price']:.2f}" if result["latest_price"] is not None else "N/A")
+        col2.metric("5d Momentum", format_percentage(result["price_change_5d_pct"]))
+        col3.metric("Volume Ratio", f"{metrics.get('volume', {}).get('volume_ratio_20d', 0):.2f}x" if metrics.get("volume", {}).get("volume_ratio_20d") is not None else "N/A")
+        col4.metric("RS vs SPY", format_percentage(result["relative_strength_vs_spy"]))
+        st.caption(f"Analyzed at PKT: {result['analyzed_at_pk_time']}")
+
+        st.write(
+            f"**Shariah:** {shariah['status']} | **Regime:** {result['regime']} | "
+            f"**Volatility:** {result['volatility_regime']} | **Catalyst:** {result['catalyst']['summary']}"
+        )
+        if result.get("error"):
+            st.error(result["error"])
+
+        if result["flags"]:
+            for flag in result["flags"]:
+                st.warning(flag)
+
+        st.write(f"Momentum Score: `{scores['momentum']:.2f}`")
+        st.write(result["narratives"].get("momentum", ""))
+        st.write(f"Volume Score: `{scores['volume']:.2f}`")
+        st.write(result["narratives"].get("volume", ""))
+        st.write(f"Confluence Score: `{scores['confluence']:.2f}`")
+        st.write(result["narratives"].get("confluence", ""))
+        st.write(f"BBW Score: `{scores['bbw']:.2f}`")
+        st.write(result["narratives"].get("bbw", ""))
+        st.write(f"Catalyst Score: `{scores['catalyst']:.2f}`")
+        st.write(result["narratives"].get("catalyst", ""))
+        st.write(f"Signal Quality: `{scores['significance']:.2f}`")
+        st.write(result["narratives"].get("significance", ""))
+        st.write(f"Shariah Note: {result['narratives'].get('shariah', '')}")
+
+        with st.expander("Raw Technical Metrics"):
+            st.json(metrics)
+
+
+def show_autonomous_vectorizer() -> None:
+    """Render the autonomous momentum vectorizer workflow."""
+    st.title("Autonomous Vectorizer")
+    st.write(
+        "Enter only a ticker, or paste/upload a batch list. The app automatically fetches "
+        "daily and intraday data, scores the setup, runs Shariah screening, and exports JSON."
+    )
+    st.caption("All timestamps and market context are shown in PKT (Asia/Karachi).")
+
+    single_ticker = st.text_input("Single ticker", placeholder="Example: UUUU", key="autonomous_single_ticker")
+    batch_text = st.text_area(
+        "Batch tickers",
+        placeholder="UUUU\nAXTI\nRKLB",
+        help="Paste tickers separated by new lines, commas, or semicolons.",
+        key="autonomous_batch_text",
+    )
+    batch_file = st.file_uploader("CSV upload", type=["csv"], key="autonomous_batch_csv")
+
+    run_single = st.button("Run Autonomous Analysis", type="primary")
+    run_batch = st.button("Run Batch Vectorization")
+
+    if "autonomous_results" not in st.session_state:
+        st.session_state["autonomous_results"] = []
+    results: list[dict] = st.session_state["autonomous_results"]
+    if run_single:
+        ticker = clean_ticker(single_ticker)
+        if not ticker:
+            st.error("Please enter a ticker symbol.")
+        else:
+            with st.spinner("Running autonomous analysis..."):
+                results = [run_autonomous_single(ticker)]
+            st.session_state["autonomous_results"] = results
+
+    if run_batch:
+        batch_tickers = parse_ticker_text(batch_text)
+        if batch_file is not None:
+            batch_tickers.extend(parse_ticker_csv(batch_file.getvalue()))
+        normalized = tuple(dict.fromkeys(batch_tickers))
+        if not normalized:
+            st.error("Please paste tickers or upload a CSV before running batch mode.")
+        else:
+            with st.spinner("Vectorizing the batch in parallel..."):
+                results = run_autonomous_batch(normalized)
+            st.session_state["autonomous_results"] = results
+
+    if not results:
+        st.info("No autonomous results yet. Run a single ticker or a batch to populate the table.")
+        return
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    tier_one_only = filter_col1.checkbox("Show Tier 1 only", value=False)
+    bullish_only = filter_col2.checkbox("Show bullish regimes only", value=False)
+    shariah_only = filter_col3.checkbox("Show Shariah pass only", value=False)
+
+    filtered_results = []
+    for item in results:
+        if tier_one_only and item["tier"] != "Tier 1":
+            continue
+        if bullish_only and item["regime"] != "uptrend":
+            continue
+        if shariah_only and item["shariah"]["status"] != "PASS":
+            continue
+        filtered_results.append(item)
+
+    summary = pd.DataFrame(_autonomous_summary_rows(filtered_results))
+    if not summary.empty:
+        st.subheader("Session Table")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+    else:
+        st.warning("The current filters removed all rows.")
+
+    export_json = export_autonomous_results_json(filtered_results)
+    filename = f"autonomous_vectorizer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    st.download_button("Download JSON", data=export_json, file_name=filename, mime="application/json")
+
+    st.subheader("Detailed Analysis")
+    for result in filtered_results:
+        show_autonomous_result_card(result)
+
+
 def show_legacy_screener() -> None:
     """Render the original screener with minimal changes."""
     st.title("Shariah Stock Screener MVP")
@@ -520,12 +695,16 @@ def show_legacy_screener() -> None:
 
 def main() -> None:
     """Build the Streamlit page."""
-    tab1, tab2, tab3 = st.tabs(["AlphaForge Phase 1", "Legacy Screener", "Momentum Vectorizer"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Autonomous Vectorizer", "AlphaForge Phase 1", "Legacy Screener", "Momentum Vectorizer"]
+    )
     with tab1:
-        show_alphaforge_screen()
+        show_autonomous_vectorizer()
     with tab2:
-        show_legacy_screener()
+        show_alphaforge_screen()
     with tab3:
+        show_legacy_screener()
+    with tab4:
         show_momentum_vectorizer()
 
 

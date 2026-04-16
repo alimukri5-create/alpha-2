@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import os
 import time
-from functools import lru_cache
 from typing import Any
 
 import requests
+import streamlit as st
 
 
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -172,7 +172,7 @@ def _get_cik_for_ticker(ticker: str) -> dict:
     }
 
 
-@lru_cache(maxsize=128)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_sec_income_data(ticker: str) -> dict:
     """Fetch best-effort income-screen data from the SEC."""
     limitations = [
